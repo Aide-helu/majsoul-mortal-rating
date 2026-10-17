@@ -20,6 +20,7 @@ import csv
 import json
 import os
 import pathlib
+import re
 import socket
 import statistics
 import subprocess
@@ -64,7 +65,7 @@ KONTEN_MAX_POINTS = 2000
 RANK_SHORT = {1: "初心", 2: "雀士", 3: "雀杰", 4: "豪", 5: "圣", 6: "魂天", 7: "魂天"}
 
 MODEL_TAG = "4.1b"
-MAX_ATTEMPTS = 1  # 一局提交一次; 失败就跳过(重跑命令会自动补), 不在这里耗时间
+MAX_ATTEMPTS = 3  # 一局最多提交 3 次(每次失败后等 25/50s 再试); 整轮跑完还会统一重试一轮, 仍失败就转人工
 
 BROWSERS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -111,6 +112,10 @@ class Game:
     accordance_detail: str = ""       # 形如 "34/45"
     task_id: str = ""                 # mjai 任务号, 存下来以便中断后直接取结果
     error: str = ""
+    player_id: int | None = None
+    nickname: str = ""
+    position: str = ""                 # 相对于输入玩家的上家/对家/下家
+    hand_stats: dict[str, int] | None = None  # 逐手统计, 见 parse_hand_stats()
 
     @property
     def when(self) -> str:
@@ -332,26 +337,45 @@ async def fetch_overview(page, uid: int, mode_ids: list[int],
     )
 
 
+RIVAL_POSITIONS = {"上家": 3, "对家": 2, "下家": 1}
+
+
 def to_game(raw: dict[str, Any], uid: int) -> Game | None:
     players = raw.get("players") or []
     seat = next((i for i, p in enumerate(players) if p.get("accountId") == uid), None)
-    if seat is None:
-        return None
-    scores = [p.get("score", 0) for p in players]
-    my_score = players[seat].get("score", 0)
-    # 同点雀魂按起家顺序排名, players 数组就是起家顺序
-    rank = 1 + sum(1 for i, s in enumerate(scores)
-                   if s > my_score or (s == my_score and i < seat))
+    return game_at_seat(raw, seat, uid) if seat is not None else None
+
+
+def game_at_seat(raw: dict[str, Any], seat: int, record_uid: int,
+                 position: str = "") -> Game:
+    """players 按起家东南西北排列；牌谱链接保留输入玩家的访问视角，跑谱按 seat 选人。"""
+    players = raw["players"]
+    player = players[seat]
+    score = player.get("score", 0)
+    rank = 1 + sum(1 for i, p in enumerate(players)
+                   if p.get("score", 0) > score or (p.get("score", 0) == score and i < seat))
     return Game(
-        uuid=raw["uuid"],
-        mode_id=raw.get("modeId", 0),
-        start_time=raw.get("startTime", 0),
-        seat=seat,
-        rank=rank,
-        score=my_score,
-        record_url=f"https://game.maj-soul.com/1/?paipu={raw['uuid']}_a{uid}",
-        pt_delta=players[seat].get("gradingScore"),
+        uuid=raw["uuid"], mode_id=raw.get("modeId", 0),
+        start_time=raw.get("startTime", 0), seat=seat, rank=rank, score=score,
+        record_url=f"https://game.maj-soul.com/1/?paipu={raw['uuid']}_a{record_uid}",
+        pt_delta=player.get("gradingScore"), player_id=player.get("accountId"),
+        nickname=player.get("nickname", ""), position=position,
     )
+
+
+def rival_games(raws: list[dict[str, Any]], uid: int) -> dict[str, list[Game]]:
+    """同一批四人牌谱按相对于输入玩家的位置汇总，位置不随庄家轮转改变。"""
+    groups: dict[str, list[Game]] = {position: [] for position in RIVAL_POSITIONS}
+    for raw in raws:
+        players = raw.get("players") or []
+        own_seat = next((i for i, p in enumerate(players) if p.get("accountId") == uid), None)
+        if own_seat is None:
+            continue
+        if len(players) != 4:
+            raise ValueError("对手分析只支持四人对局，无法生成上家/对家/下家三份结果")
+        for position, offset in RIVAL_POSITIONS.items():
+            groups[position].append(game_at_seat(raw, (own_seat + offset) % 4, uid, position))
+    return groups
 
 
 def pct(x: float | None) -> str:
@@ -585,6 +609,7 @@ def apply_report(game: Game, report: dict[str, Any]) -> None:
     if isinstance(matches, int) and isinstance(total, int) and total:
         game.accordance = round(matches / total, 4)
         game.accordance_detail = f"{matches}/{total}"
+    game.hand_stats = parse_hand_stats(report.get("mjai_log") or [], game.seat)
 
 
 async def review_all(ctx, games: list[Game], cache: pathlib.Path, concurrency: int,
@@ -685,6 +710,82 @@ async def review_all(ctx, games: list[Game], cache: pathlib.Path, concurrency: i
 
 
 # --------------------------------------------------------------------------------------
+# 人工兜底: 自动提交实在过不去验证时, 打开页面让用户自己点 (一次只处理一局)
+# --------------------------------------------------------------------------------------
+
+MANUAL_TIP_JS = """([i, n, when, rank]) => {
+    const box = document.createElement('dialog');
+    box.style.cssText = 'position:fixed;z-index:2147483647;top:16px;left:50%;'
+        + 'transform:translateX(-50%);background:#c0392b;color:#fff;border:0;border-radius:8px;'
+        + 'padding:12px 22px;font:16px/1.6 "Microsoft YaHei",sans-serif;text-align:center;'
+        + 'box-shadow:0 6px 24px rgba(0,0,0,.35);max-width:92vw';
+    box.innerHTML = `<b>需要人工介入 (${i}/${n})</b><br>这局自动提交失败，请手动过验证并点「提交」`
+        + `<br><small>${when} ${rank}位</small>`;
+    document.body.appendChild(box);
+    if (box.show) box.show(); else box.setAttribute('open', '');
+    document.title = `需人工介入 (${i}/${n}) ` + document.title;
+}"""
+
+
+async def manual_submit(ctx, game: Game, idx: int, total: int, timeout: float) -> str:
+    """打开提交页并填好表单, 弹窗提示人工介入, 等用户自己提交后返回任务号."""
+    page = await ctx.new_page()
+    try:
+        await page.goto(MJAI_FORM, wait_until="domcontentloaded", timeout=60_000)
+        await page.fill("input[name=log-url]", game.record_url)
+        await page.select_option("select[name=engine]", "mortal")
+        await page.select_option("select[name=mortal-model-tag]", MODEL_TAG)
+        await page.select_option("select[name=player-id]", str(game.seat))
+        await page.bring_to_front()
+        await page.evaluate(MANUAL_TIP_JS, [idx, total, game.when, game.rank])
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if "task=" in page.url:
+                return page.url.split("task=")[-1].split("&")[0]
+            await page.wait_for_timeout(1_000)
+        raise TimeoutError(f"人工介入超时, 一直没提交 ({int(timeout)}s)")
+    finally:
+        await page.close()
+
+
+async def manual_review(ctx, games: list[Game], cache: pathlib.Path, state: dict[str, Any],
+                        timeout: float = 900.0) -> None:
+    """兜底: 逐局(不并发)打开页面等人工提交, 提交完再等报告取结果."""
+    bad = [g for g in games if g.rating is None]
+    if not bad:
+        return
+
+    def save() -> None:
+        state["games"] = [asdict(g) for g in games]
+        cache.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    for idx, game in enumerate(bad, 1):
+        print(f"      [{idx}/{len(bad)}] 需要人工介入: {game.when} {game.rank}位 {game.record_url}",
+              flush=True)
+        try:
+            task_id = await manual_submit(ctx, game, idx, len(bad), timeout)
+        except Exception as exc:  # noqa: BLE001
+            game.error = f"{type(exc).__name__}: {exc}"
+            print(f"    人工介入没完成 {game.when}: {game.error}", flush=True)
+            save()
+            continue
+        game.task_id = task_id
+        game.error = ""
+        save()
+        try:
+            report = await wait_report(task_id)
+            apply_report(game, report)
+            game.task_id = ""
+            print(f"    人工介入完成 {game.when}  分数 {game.rating}  AI 一致率 "
+                  f"{game.accordance_detail} = {game.accordance * 100:.1f}%", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            game.error = f"{type(exc).__name__}: {exc}"
+            game.task_id = ""
+            print(f"    人工介入已提交但取结果失败 {game.when}: {game.error}", flush=True)
+        save()
+
+
+# --------------------------------------------------------------------------------------
 # 阶段三: 输出
 # --------------------------------------------------------------------------------------
 
@@ -710,7 +811,8 @@ def cumulative_pt(done: list[Game], score_now: int | None, cap: int) -> list[flo
 
 
 def draw_chart(games: list[Game], uid: int, nickname: str, overview: list[str],
-               level_score: int | None, level_cap: int, out_png: pathlib.Path) -> None:
+               level_score: int | None, level_cap: int, out_png: pathlib.Path,
+               aggregate_pt: bool = False) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -791,16 +893,24 @@ def draw_chart(games: list[Game], uid: int, nickname: str, overview: list[str],
         ax_pt.set_ylim(-span * 1.6, span * 1.6)
     ax_pt.grid(alpha=0.25)
 
-    cum = cumulative_pt(done, level_score, level_cap)
+    if aggregate_pt:
+        # 多位对手的 pt 收支只从 0 累加，不反推某一位玩家的段位分。
+        total = 0
+        cum = []
+        for delta in deltas:
+            total = total + delta if total is not None and delta is not None else None
+            cum.append(total)
+    else:
+        cum = cumulative_pt(done, level_score, level_cap)
     cum_pts = [(x, c) for x, c in zip(xs, cum) if c is not None]
     if len(cum_pts) >= 2:
         ax_cum = ax_pt.twinx()
         ax_cum.plot([p[0] for p in cum_pts], [p[1] for p in cum_pts], marker="D", ms=4,
-                    lw=1.8, color="#9467bd", label="段位分走势")
-        ax_cum.set_ylabel("段位分", color="#9467bd")
+                    lw=1.8, color="#9467bd", label="累计 pt 收支" if aggregate_pt else "段位分走势")
+        ax_cum.set_ylabel("累计 pt 收支" if aggregate_pt else "段位分", color="#9467bd")
         ax_cum.tick_params(axis="y", labelcolor="#9467bd")
         ax_cum.margins(y=0.12)
-        if len(cum_pts) < len(xs):
+        if not aggregate_pt and len(cum_pts) < len(xs):
             ax_cum.set_title("（段位分走势在升/降段处断开）", fontsize=8, color="#888")
 
         # 标出最高 / 最低 / 最近那一场
@@ -852,6 +962,7 @@ def draw_chart(games: list[Game], uid: int, nickname: str, overview: list[str],
             pass
 
     fig.savefig(out_png)
+    plt.close(fig)
     print(f"  [OK] 图 (rating + pt): {out_png}")
 
 
@@ -891,14 +1002,16 @@ def clean_previous(out_dir: pathlib.Path, uid: int, fresh: bool) -> None:
         print(f"      已清掉上次的结果: {', '.join(removed)}")
 
 
-def write_csv(games: list[Game], path: pathlib.Path) -> None:
+def write_csv(games: list[Game], path: pathlib.Path, include_players: bool = False) -> None:
     rows = sorted(games, key=lambda g: g.start_time)
     with path.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["时间", "场次", "顺位", "点数", "段位分变化", "分数(rating)", "AI一致率",
-                    "一致率明细", "牌谱", "备注"])
+        player_headers = ["相对位置", "玩家UID", "玩家昵称", "座位(0=东)"] if include_players else []
+        w.writerow(player_headers + ["时间", "场次", "顺位", "点数", "段位分变化", "分数(rating)", "AI一致率",
+                                    "一致率明细", "牌谱", "备注"])
         for g in rows:
-            w.writerow([
+            player_values = [g.position, g.player_id, g.nickname, g.seat] if include_players else []
+            w.writerow(player_values + [
                 g.when, MODE_BY_ID.get(g.mode_id, g.mode_id), g.rank, g.score,
                 "" if g.pt_delta is None else g.pt_delta,
                 "" if g.rating is None else g.rating,
@@ -913,40 +1026,298 @@ def write_csv(games: list[Game], path: pathlib.Path) -> None:
 # --------------------------------------------------------------------------------------
 
 
-async def run(args: argparse.Namespace) -> int:
+def player_output_dir(base: pathlib.Path, nickname: str, rival: bool = False) -> pathlib.Path:
+    """保留昵称中的 #，替换 Windows 文件名禁用字符。"""
+    folder = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", nickname).rstrip(" .") or "player"
+    if folder.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)],
+                                         *[f"LPT{i}" for i in range(1, 10)]}:
+        folder = "_" + folder
+    return base / (folder + "_rival" if rival else folder)
+
+
+def restore_cache(cache: pathlib.Path, games: list[Game], uid: int, position: str = "",
+                  require_stats: bool = False) -> None:
+    if not cache.exists():
+        return
+    try:
+        old = json.loads(cache.read_text(encoding="utf-8"))
+        if not isinstance(old, dict):
+            return
+        if old.get("uid") != uid or old.get("position", "") != position:
+            return
+        if old.get("model", MODEL_TAG) != MODEL_TAG:
+            return
+        prev = {(g["uuid"], g["seat"]): g for g in old.get("games", [])}
+        for game in games:
+            cached = prev.get((game.uuid, game.seat))
+            if not cached or cached.get("player_id") not in (None, game.player_id):
+                continue
+            if require_stats and not cached.get("hand_stats"):
+                continue  # 旧版缓存没有逐手统计, 这局重跑一次
+            if cached.get("rating") is not None:
+                game.rating = cached["rating"]
+                game.accordance = cached.get("accordance")
+                game.accordance_detail = cached.get("accordance_detail", "")
+                game.hand_stats = cached.get("hand_stats") or None
+            elif cached.get("task_id"):
+                game.task_id = cached["task_id"]
+        count = sum(g.rating is not None for g in games)
+        if count:
+            print(f"      复用上次已跑完的 {count} 局 (断点续跑)")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+
+# --------------------------------------------------------------------------------------
+# 逐手统计 (起手向听 / 一发 / 立直) —— 数据来自 mjai 报告里的 mjai_log
+# --------------------------------------------------------------------------------------
+
+HONOR_INDEX = {"E": 27, "S": 28, "W": 29, "N": 30, "P": 31, "F": 32, "C": 33}
+SUIT_BASE = {"m": 0, "p": 9, "s": 18}
+KOKUSHI = (0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33)
+
+
+def tile_index(pai: Any) -> int | None:
+    """mjai 的牌字符串 ("3m" / "C" / "5pr") -> 34 种牌的下标."""
+    if not isinstance(pai, str) or not pai:
+        return None
+    if pai in HONOR_INDEX:  # 字牌是单字符 (E/S/W/N/P/F/C)
+        return HONOR_INDEX[pai]
+    if len(pai) == 3 and pai[2] == "r":  # "5pr" 这种赤五写法
+        pai = pai[:2]
+    if len(pai) != 2:
+        return None
+    base = SUIT_BASE.get(pai[-1])
+    num = pai[0]
+    if base is None or not num.isdigit():
+        return None
+    n = 5 if num == "0" else int(num)  # "0m" 是赤五
+    return base + n - 1 if 1 <= n <= 9 else None
+
+
+def standard_shanten(counts: list[int]) -> int:
+    """标准型(4 面子 + 1 雀头)向听数, counts 是 34 种牌的张数."""
+    best = 8
+
+    def dfs(i: int, melds: int, taatsu: int, pair: int) -> None:
+        nonlocal best
+        if i == 34:
+            m, t = min(melds, 4), min(taatsu, 4 - min(melds, 4))
+            best = min(best, 8 - 2 * m - t - pair)
+            return
+        n = counts[i]
+        if n >= 3:  # 刻子
+            counts[i] -= 3
+            dfs(i, melds + 1, taatsu, pair)
+            counts[i] += 3
+        if n >= 2 and not pair:  # 雀头
+            counts[i] -= 2
+            dfs(i, melds, taatsu, 1)
+            counts[i] += 2
+        if n >= 2 and taatsu < 4:  # 对子当搭子
+            counts[i] -= 2
+            dfs(i, melds, taatsu + 1, pair)
+            counts[i] += 2
+        if i < 27:
+            pos = i % 9
+            if pos <= 6 and counts[i] and counts[i + 1] and counts[i + 2]:  # 顺子
+                counts[i] -= 1
+                counts[i + 1] -= 1
+                counts[i + 2] -= 1
+                dfs(i, melds + 1, taatsu, pair)
+                counts[i] += 1
+                counts[i + 1] += 1
+                counts[i + 2] += 1
+            if pos <= 7 and counts[i] and counts[i + 1] and taatsu < 4:  # 两面/边张
+                counts[i] -= 1
+                counts[i + 1] -= 1
+                dfs(i, melds, taatsu + 1, pair)
+                counts[i] += 1
+                counts[i + 1] += 1
+            if pos <= 6 and counts[i] and counts[i + 2] and taatsu < 4:  # 嵌张
+                counts[i] -= 1
+                counts[i + 2] -= 1
+                dfs(i, melds, taatsu + 1, pair)
+                counts[i] += 1
+                counts[i + 2] += 1
+        dfs(i + 1, melds, taatsu, pair)
+
+    dfs(0, 0, 0, 0)
+    return best
+
+
+def hand_shanten(tehai: list[Any]) -> int:
+    """13 张配牌的向听数 (标准型 / 七对子 / 国士无双向听, 取最小)."""
+    counts = [0] * 34
+    for pai in tehai:
+        idx = tile_index(pai)
+        if idx is not None:
+            counts[idx] += 1
+    pairs = sum(1 for n in counts if n >= 2)
+    kinds = sum(1 for n in counts if n)
+    chiitoi = 6 - pairs + max(0, 7 - kinds)
+    honor_pairs = any(counts[i] >= 2 for i in KOKUSHI)
+    kokushi = 13 - sum(1 for i in KOKUSHI if counts[i]) - (1 if honor_pairs else 0)
+    return min(standard_shanten(counts), chiitoi, kokushi)
+
+
+def parse_hand_stats(log: list[dict[str, Any]], seat: int) -> dict[str, int]:
+    """从 mjai 逐手日志统计某个座位: 和了/一发/立直(巡目, 和了)/起手向听(亲/子).
+
+    mjai 的 hora 事件里没有役种列表, 所以「一发」按规则推断:
+    立直宣言后, 在自己下一次打牌(或任何人鸣牌/杠)之前和了, 就算一发.
+    """
+    st = {"hora": 0, "ippatsu": 0, "riichi": 0, "riichi_win": 0, "riichi_turn_sum": 0,
+          "oya_n": 0, "oya_shanten_sum": 0, "ko_n": 0, "ko_shanten_sum": 0}
+    discards = [0, 0, 0, 0]
+    reach_turn: dict[int, int] = {}   # 本局宣言立直的座位 -> 巡目
+    riichi = [False] * 4              # 本局已成立的立直
+    ippatsu = [False] * 4             # 一发窗口开着
+    dealer_tehai: list[Any] | None = None  # 自家是亲时, 等第一张摸牌再算向听(14 张)
+
+    def close_windows() -> None:
+        for k in range(4):
+            ippatsu[k] = False
+
+    for ev in log:
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("type")
+        if kind == "start_kyoku":
+            discards = [0, 0, 0, 0]
+            reach_turn, riichi, ippatsu = {}, [False] * 4, [False] * 4
+            dealer_tehai = None
+            tehais = ev.get("tehais") or []
+            if 0 <= seat < len(tehais) and len(tehais[seat]) == 13:
+                if ev.get("oya") == seat:
+                    dealer_tehai = list(tehais[seat])  # 亲家多摸一张, 见下面 tsumo 分支
+                else:
+                    st["ko_n"] += 1
+                    st["ko_shanten_sum"] += hand_shanten(tehais[seat])
+        elif kind == "tsumo":
+            if dealer_tehai is not None and ev.get("actor") == seat:
+                pai = ev.get("pai")
+                if tile_index(pai) is not None:
+                    st["oya_n"] += 1
+                    st["oya_shanten_sum"] += hand_shanten(dealer_tehai + [pai])
+                dealer_tehai = None
+        elif kind == "reach":
+            actor = ev.get("actor")
+            if actor == seat:
+                reach_turn[seat] = discards[seat] + 1
+        elif kind == "reach_accepted":
+            actor = ev.get("actor")
+            if actor == seat and seat in reach_turn:
+                st["riichi"] += 1
+                st["riichi_turn_sum"] += reach_turn[seat]
+                riichi[seat] = True
+                ippatsu[seat] = True
+            reach_turn.pop(actor, None)
+        elif kind == "dahai":
+            actor = ev.get("actor")
+            if isinstance(actor, int) and 0 <= actor < 4:
+                ippatsu[actor] = False  # 自己打牌, 一发窗口关闭
+                discards[actor] += 1
+        elif kind in ("chi", "pon", "daiminkan", "ankan", "kakan"):
+            close_windows()           # 鸣牌/杠, 所有人的一发窗口都关闭
+        elif kind == "hora":
+            if ev.get("actor") == seat:
+                st["hora"] += 1
+                if ippatsu[seat]:
+                    st["ippatsu"] += 1
+                if riichi[seat]:
+                    st["riichi_win"] += 1
+                ippatsu[seat] = False
+        elif kind in ("end_kyoku", "ryukyoku"):
+            close_windows()
+    return st
+
+
+def format_rival_overview(games: list[Game], nickname: str, uid: int,
+                          position: str, mode_names: str) -> list[str]:
+    n = len(games)
+    rated = [g.rating for g in games if g.rating is not None]
+    accs = [g.accordance for g in games if g.accordance is not None]
+    deltas = [g.pt_delta for g in games if g.pt_delta is not None]
+    rates = "/".join(f"{sum(g.rank == r for g in games) / n * 100:.1f}" for r in range(1, 5))
+    lines = [
+        f"{nickname} (UID {uid}) 的{position}",
+        f"{mode_names}   最近 {n} 场对手汇总",
+        "每场按相对座位选择一位对手",
+        "",
+        f"1~4位 %    {rates}",
+        f"平均顺位    {statistics.fmean(g.rank for g in games):.3f}",
+        f"平均点数    {statistics.fmean(g.score for g in games):.0f}",
+        f"被飞率      {sum(g.score < 0 for g in games) / n * 100:.1f}%",
+        "最近战绩 [" + "".join(str(g.rank) for g in sorted(games, key=lambda g: g.start_time)[-10:]) + "]",
+        "",
+        f"跑谱成功 {len(rated)}/{n} 局，失败 {n - len(rated)} 局",
+        f"Rating 均 {statistics.fmean(rated):.1f}" if rated else "Rating 均 -",
+        f"AI 一致率 均 {statistics.fmean(accs) * 100:.1f}%" if accs else "AI 一致率 均 -",
+    ]
+    if deltas:
+        lines.append(f"pt 合计 {sum(deltas):+d} (均 {statistics.fmean(deltas):+.1f}/局)")
+
+    hands = [g.hand_stats for g in games if g.hand_stats]
+    if hands:
+        def total(key: str) -> int:
+            return sum(int(h.get(key) or 0) for h in hands)
+
+        hora, ippatsu = total("hora"), total("ippatsu")
+        riichi, riichi_win = total("riichi"), total("riichi_win")
+        turns = total("riichi_turn_sum")
+        oya_n, oya_sum = total("oya_n"), total("oya_shanten_sum")
+        ko_n, ko_sum = total("ko_n"), total("ko_shanten_sum")
+        lines += [
+            "",
+            f"一发率      {pct(ippatsu / hora) if hora else '-'} ({ippatsu}/{hora})",
+            f"立直和了率  {pct(riichi_win / riichi) if riichi else '-'} ({riichi_win}/{riichi})",
+            f"立直巡目    {turns / riichi:.2f}" if riichi else "立直巡目    -",
+            f"起手向听    {(oya_sum + ko_sum) / (oya_n + ko_n):.2f} "
+            f"(亲 {oya_sum / oya_n:.2f} / 子 {ko_sum / ko_n:.2f})"
+            if oya_n and ko_n else "起手向听      -",
+        ]
+    lines += [f"pt 有效数据 {len(deltas)}/{n} 场", "", "统计范围：仅输入玩家这批牌谱", "各局对手可能不同，pt 从 0 累计", "段位及牌谱屋面板统计不适用"]
+    return lines
+
+
+async def run(args: argparse.Namespace, rival: bool = False) -> int:
     from playwright.async_api import async_playwright
 
-    out_dir = pathlib.Path(args.out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache = out_dir / "results.json"
-
+    base_dir = pathlib.Path(args.out).resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
     mode_ids: list[int] = []
-    for m in args.mode:
-        mid = int(m) if m.isdigit() else MODES.get(m)
+    for mode in args.mode:
+        mid = int(mode) if mode.isdigit() else MODES.get(mode)
         if mid is None:
-            raise SystemExit(f"未知场次 {m!r}, 可用: {', '.join(MODES)}")
+            raise SystemExit(f"未知场次 {mode!r}, 可用: {', '.join(MODES)}")
+        if rival and mid not in (8, 9, 11, 12, 15, 16):
+            raise SystemExit("对手分析只支持四人场次：王座 玉 金 王东 玉东 金东")
         mode_ids.append(mid)
     mode_names = "/".join(MODE_FULL.get(m, str(m)) for m in mode_ids)
-
     exe = find_browser()
     port = free_port()
     print(f"启动浏览器: {exe}")
-    proc = launch_browser(exe, port, out_dir / ".browser_profile")
+    proc = launch_browser(exe, port, base_dir / ".browser_profile")
+    results = []
+    jobs = []  # (position, games, cache, state), 供末尾重试/人工介入复用
+    ov: dict[str, Any] = {}
 
-    uid = 0
-    nickname = ""
-    games: list[Game] = []
-    overview: list[str] = []
-    level_score: int | None = None
-    level_cap = 0
-    state: dict[str, Any] = {}
+    def group_overview(gs: list[Game], pos: str) -> list[str]:
+        if rival:
+            return format_rival_overview(gs, nickname, uid, pos, mode_names)
+        return format_overview(ov, gs, mode_names, uid)
+
+    def save_group(cache_p: pathlib.Path, st: dict[str, Any], gs: list[Game], pos: str) -> None:
+        st["overview"] = group_overview(gs, pos)
+        st["games"] = [asdict(x) for x in gs]
+        cache_p.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
             ctx = browser.contexts[0]
-
-            print("[1/3] 读取对局列表与战绩概览 ...")
-            # 关掉浏览器自带的多余标签页(初始 about:blank / 推荐页), 只留我们自己用的
+            print("[1/3] 读取对局列表 ...")
             for extra in list(ctx.pages)[1:]:
                 try:
                     await extra.close()
@@ -954,95 +1325,105 @@ async def run(args: argparse.Namespace) -> int:
                     pass
             page = await ctx.new_page()
             uid, nickname = await resolve_player(page, args.id or args.name, mode_ids)
-            clean_previous(out_dir, uid, args.fresh)
+            out_dir = player_output_dir(base_dir, nickname, rival)
             raws = await fetch_records(page, uid, mode_ids, args.games)
-            games = [g for g in (to_game(r, uid) for r in raws) if g]
-            # 用最近这批对局最早一局的开始时间当起点, 这样拿到的是"最近 N 场"的统计
-            since_ms = min((g.start_time for g in games), default=0) * 1000 or EARLIEST_MS
-            ov = await fetch_overview(page, uid, mode_ids, since_ms)
+            if rival:
+                groups = rival_games(raws, uid)
+                ov = {}
+            else:
+                groups = {"": [g for g in (to_game(r, uid) for r in raws) if g]}
+                games = groups[""]
+                since_ms = min((g.start_time for g in games), default=0) * 1000 or EARLIEST_MS
+                ov = await fetch_overview(page, uid, mode_ids, since_ms)
             await page.close()
-            if not games:
+            if not any(groups.values()):
                 print("      没有取到任何对局, 换个场次类型试试")
                 return 1
-            print(f"      取到 {len(games)} 局 (最近 {games[0].when} ~ {games[-1].when})")
 
             lv = (ov.get("all") or {}).get("level") or {}
             level_score = lv.get("score")
             level_cap = level_info(lv.get("id"))[1]
-            overview = format_overview(ov, games, mode_names, uid)
-            print_overview(overview)
+            for position, games in groups.items():
+                target_dir = out_dir / position if position else out_dir
+                target_dir.mkdir(parents=True, exist_ok=True)
+                clean_previous(target_dir, uid, args.fresh)
+                cache = target_dir / "results.json"
+                restore_cache(cache, games, uid, position, require_stats=rival)
+                # 兼容旧版放在 rating_out 根目录的自身缓存；不改动旧文件。
+                if not rival and not args.fresh and not cache.exists():
+                    restore_cache(base_dir / "results.json", games, uid)
+                print(f"      {position or nickname}: 取到 {len(games)} 局，输出到 {target_dir}")
 
-            if cache.exists():
-                try:
-                    old = json.loads(cache.read_text(encoding="utf-8"))
-                    prev = {g["uuid"]: g for g in old.get("games", [])}
-                    for g in games:
-                        o = prev.get(g.uuid)
-                        if not o:
-                            continue
-                        if o.get("rating") is not None:
-                            g.rating = o["rating"]
-                            g.accordance = o.get("accordance")
-                            g.accordance_detail = o.get("accordance_detail", "")
-                        elif o.get("task_id"):
-                            g.task_id = o["task_id"]  # 上次已提交过, 这次直接取结果
-                    n = sum(1 for g in games if g.rating is not None)
-                    if n:
-                        print(f"      复用上次已跑完的 {n} 局 (断点续跑)")
-                except Exception:  # noqa: BLE001
-                    pass
+                overview = group_overview(games, position)
+                print_overview(overview)
+                state = {"uid": uid, "nickname": nickname, "position": position, "model": MODEL_TAG,
+                         "overview": overview, "games": [asdict(g) for g in games]}
+                print(f"[2/3] {position or nickname} Mortal {MODEL_TAG} 跑谱 (并发 {args.concurrency}) ...")
+                await review_all(ctx, games, cache, args.concurrency, state)
+                save_group(cache, state, games, position)
+                results.append((position, games, target_dir))
+                jobs.append((position, games, cache, state))
 
-            state = {"uid": uid, "nickname": nickname, "overview": overview,
-                     "games": [asdict(g) for g in games]}
-            print(f"[2/3] Mortal {MODEL_TAG} 跑谱 (并发 {args.concurrency}) ...")
-            await review_all(ctx, games, cache, args.concurrency, state)
-            # 跑完了, 概览重算一次, 这样能带上 Rating / AI 一致率的均值
-            overview = format_overview(ov, games, mode_names, uid)
-            state["overview"] = overview
-            state["games"] = [asdict(g) for g in games]
-            cache.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            # 正常跑完后还有失败的局: 先整体重试一轮, 剩下的再逐局交给人
+            if any(g.rating is None for _, gs, _, _ in jobs for g in gs):
+                print("\n[!] 有局没跑出来, 开始重试 ...")
+                for position, games, cache, state in jobs:
+                    left = sum(g.rating is None for g in games)
+                    if not left:
+                        continue
+                    print(f"      {position or nickname}: 重试 {left} 局 (并发 {args.concurrency}) ...")
+                    await review_all(ctx, games, cache, args.concurrency, state)
+                    save_group(cache, state, games, position)
+            for position, games, cache, state in jobs:
+                left = sum(g.rating is None for g in games)
+                if not left:
+                    continue
+                print(f"\n[!] {position or nickname} 还有 {left} 局自动提交不了, 转人工介入 "
+                      f"(一次一局, 请在浏览器里手动过验证并提交)")
+                await manual_review(ctx, games, cache, state)
+                save_group(cache, state, games, position)
             await ctx.close()
             try:
-                await browser.close()  # 优雅关闭, 免得下次启动弹"Edge 意外关闭"
+                await browser.close()
             except Exception:  # noqa: BLE001
                 pass
     finally:
         close_browser(proc)
 
     print("[3/3] 输出 ...")
-    write_csv(games, out_dir / f"rating_{uid}.csv")
-    png = out_dir / f"rating_{uid}.png"
-    draw_chart(games, uid, nickname, overview, level_score, level_cap, png)
-    summary_txt = out_dir / f"summary_{uid}.txt"
-    summary_txt.write_text("\n".join(overview) + "\n", encoding="utf-8")
-    print(f"  [OK] 概览文本: {summary_txt}")
-
-    if not args.no_show and png.exists():
-        print("  [OK] 正在打开图片窗口 ...")
-        open_file(png)
-
-    ok = [g for g in games if g.rating is not None]
-    if ok:
-        print(f"\n平均 Rating: {statistics.fmean(g.rating for g in ok):.1f}   "
-              f"(成功 {len(ok)}/{len(games)} 局)")
-
-    bad = [g for g in games if g.rating is None]
-    if bad:
-        print(f"\n有 {len(bad)} 局没跑出来 (重跑同一条命令会自动只补这些):")
-        for g in bad[:8]:
-            print(f"  {g.when} {g.rank}位  {g.error[:88]}")
-        if len(bad) > 8:
-            print(f"  ... 其余 {len(bad) - 8} 局见 CSV 的「备注」列")
+    for position, games, target_dir in results:
+        overview = group_overview(games, position)
+        write_csv(games, target_dir / f"rating_{uid}.csv", include_players=rival)
+        png = target_dir / f"rating_{uid}.png"
+        title = f"{nickname} 的{position}" if rival else nickname
+        draw_chart(games, uid, title, overview, level_score, level_cap, png, aggregate_pt=rival)
+        summary_txt = target_dir / f"summary_{uid}.txt"
+        summary_txt.write_text("\n".join(overview) + "\n", encoding="utf-8")
+        print(f"  [OK] 概览文本: {summary_txt}")
+        if not args.no_show and png.exists():
+            open_file(png)
+        ok = [g for g in games if g.rating is not None]
+        if ok:
+            print(f"\n{position or nickname} 平均 Rating: {statistics.fmean(g.rating for g in ok):.1f} "
+                  f"(成功 {len(ok)}/{len(games)} 局)")
+        bad = [g for g in games if g.rating is None]
+        if bad:
+            print(f"\n{position or nickname} 有 {len(bad)} 局没跑出来 (重跑同一条命令会自动只补这些):")
+            for game in bad[:8]:
+                print(f"  {game.when} {game.rank}位  {game.error[:88]}")
+            if len(bad) > 8:
+                print(f"  ... 其余 {len(bad) - 8} 局见 CSV 的「备注」列")
     return 0
 
 
-def main() -> int:
+def main(rival: bool = False) -> int:
     for stream in (sys.stdout, sys.stderr):  # 别让 Windows 控制台编码把程序搞崩
         try:
             stream.reconfigure(errors="replace")  # type: ignore[union-attr]
         except Exception:  # noqa: BLE001
             pass
-    ap = argparse.ArgumentParser(description="雀魂批量跑谱 + rating/pt 折线图 (Mortal 4.1b)")
+    description = "雀魂对手批量跑谱：上家/对家/下家" if rival else "雀魂批量跑谱 + rating/pt 折线图 (Mortal 4.1b)"
+    ap = argparse.ArgumentParser(description=description)
     who = ap.add_mutually_exclusive_group(required=True)
     who.add_argument("--id", help="雀魂 UID")
     who.add_argument("--name", help="雀魂昵称")
@@ -1051,14 +1432,16 @@ def main() -> int:
                     help=f"场次类型, 可重复使用: {' / '.join(MODES)} (默认 玉)")
     ap.add_argument("--concurrency", type=int, default=3,
                     help="同时开几个页面提交 (默认 3; 实测调到 8 以上人机验证会直接全挂, 别贪多)")
-    ap.add_argument("--out", default="rating_out", help="输出目录 (默认 rating_out)")
+    ap.add_argument("--out", default="rating_out", help="输出根目录，按玩家昵称分类 (默认 rating_out)")
     ap.add_argument("--no-show", action="store_true", help="跑完不自动弹出图片窗口")
     ap.add_argument("--fresh", action="store_true",
                     help="连跑谱缓存一起清掉, 全部重新跑 (默认保留缓存以便断点续跑)")
     args = ap.parse_args()
     args.mode = args.mode or ["玉"]
+    if args.games < 1 or args.concurrency < 1:
+        ap.error("--games 和 --concurrency 必须为正整数")
     try:
-        return asyncio.run(run(args))
+        return asyncio.run(run(args, rival=rival))
     except KeyboardInterrupt:
         print("\n已中断 (进度保存在 results.json, 重跑会自动续上)")
         return 130
