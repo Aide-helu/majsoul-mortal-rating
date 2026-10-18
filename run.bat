@@ -2,6 +2,15 @@
 cd /d "%~dp0"
 title 雀魂 rating 批量跑谱
 
+rem 找到可用的 python (没装 playwright 的话会在 .venv 里自动装, 只装一次)
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0bootstrap.ps1"`) do set "PY=%%P"
+if not defined PY (
+  echo.
+  echo  环境准备失败, 按上面的提示处理后再双击一次.
+  pause
+  exit /b 1
+)
+
 echo ============================================================
 echo            雀魂 rating 批量跑谱 (Mortal 4.1b)
 echo ============================================================
@@ -30,7 +39,7 @@ echo  中途可以按 Ctrl+C 中断, 下次跑会接着跑没跑完的局.
 echo ------------------------------------------------------------
 echo.
 
-python mahjong_rating.py --id "%WHO%" --games %GAMES% --mode %MODE%
+"%PY%" mahjong_rating.py --id "%WHO%" --games %GAMES% --mode %MODE%
 
 echo.
 echo ============================================================

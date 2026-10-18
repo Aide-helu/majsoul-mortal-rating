@@ -19,5 +19,6 @@ reasonix.toml
 
 # 临时文件
 .scratch/
+_logs/
 *.utf8
 *.tmp

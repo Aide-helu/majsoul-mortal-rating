@@ -391,6 +391,31 @@ def ago(now_s: int, then_s: int) -> str:
     return f"{d // 86400}日前"
 
 
+def dealer_lines(hands: list[dict[str, int]]) -> list[str]:
+    """做庄时的立直率/和了率, 以及同一局闲家 9 巡内的立直率/自摸率."""
+    if not hands:
+        return []
+
+    def total(key: str) -> int:
+        return sum(int(h.get(key) or 0) for h in hands)
+
+    def rate(num: int, den: int) -> str:
+        return pct(num / den) if den else "-"
+
+    kyoku = total("oya_kyoku")
+    rival_n = total("oya_rival_n")
+    if not kyoku:
+        return ["庄家统计    -", "闲家9巡内    -"]
+    oya_riichi, oya_hora = total("oya_riichi"), total("oya_hora")
+    rival_riichi9, rival_tsumo9 = total("oya_rival_riichi9"), total("oya_rival_tsumo9")
+    return [
+        f"庄家        亲局 {kyoku}   立直率 {rate(oya_riichi, kyoku)} ({oya_riichi}/{kyoku})"
+        f"   和了率 {rate(oya_hora, kyoku)} ({oya_hora}/{kyoku})",
+        f"闲家9巡内   立直率 {rate(rival_riichi9, rival_n)} ({rival_riichi9}/{rival_n})"
+        f"   自摸率 {rate(rival_tsumo9, rival_n)} ({rival_tsumo9}/{rival_n})",
+    ]
+
+
 def format_overview(ov: dict[str, Any], games: list[Game], mode_names: str, uid: int) -> list[str]:
     """拼出概览文本: 玩家信息 + 「最近 N 场 / 总体」两列完整统计 + 安定段."""
     stats = ov.get("all") or {}
@@ -471,6 +496,11 @@ def format_overview(ov: dict[str, Any], games: list[Game], mode_names: str, uid:
         lines.append(f"AI 一致率 均 {statistics.fmean(accs) * 100:.1f}%")
     if deltas:
         lines.append(f"pt 合计 {sum(deltas):+d} (均 {statistics.fmean(deltas):+.1f}/局)")
+    hands = [g.hand_stats for g in games if g.hand_stats]
+    dlines = dealer_lines(hands)
+    if dlines:
+        lines.append("")
+        lines += dlines
     lines.append("")
     lines += stability_lines(deltas, lv_cap, lv_score, lv_name)
     return lines
@@ -613,7 +643,7 @@ def apply_report(game: Game, report: dict[str, Any]) -> None:
 
 
 async def review_all(ctx, games: list[Game], cache: pathlib.Path, concurrency: int,
-                     state: dict[str, Any]) -> None:
+                     state: dict[str, Any], merge: bool = True) -> None:
     """
     两阶段跑谱, 避免"一局一局串着等":
       1) 并发提交, 先把所有局的任务号拿到 (这一步要开浏览器过验证, 受 concurrency 限制)
@@ -633,7 +663,7 @@ async def review_all(ctx, games: list[Game], cache: pathlib.Path, concurrency: i
 
     def save() -> None:
         state["games"] = [asdict(g) for g in games]
-        cache.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        write_cache(cache, state, merge=merge)
 
     # ---------------- 阶段 1: 并发提交 ----------------
     if task_ids:
@@ -749,7 +779,7 @@ async def manual_submit(ctx, game: Game, idx: int, total: int, timeout: float) -
 
 
 async def manual_review(ctx, games: list[Game], cache: pathlib.Path, state: dict[str, Any],
-                        timeout: float = 900.0) -> None:
+                        timeout: float = 900.0, merge: bool = True) -> None:
     """兜底: 逐局(不并发)打开页面等人工提交, 提交完再等报告取结果."""
     bad = [g for g in games if g.rating is None]
     if not bad:
@@ -757,7 +787,7 @@ async def manual_review(ctx, games: list[Game], cache: pathlib.Path, state: dict
 
     def save() -> None:
         state["games"] = [asdict(g) for g in games]
-        cache.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        write_cache(cache, state, merge=merge)
 
     for idx, game in enumerate(bad, 1):
         print(f"      [{idx}/{len(bad)}] 需要人工介入: {game.when} {game.rank}位 {game.record_url}",
@@ -979,27 +1009,39 @@ def open_file(path: pathlib.Path) -> None:
         print(f"  ! 打不开图片查看器 ({exc}), 图片在: {path}")
 
 
-def clean_previous(out_dir: pathlib.Path, uid: int, fresh: bool) -> None:
-    """清掉上一次跑出来的结果, 免得跟这次的混在一起."""
-    removed = []
-    for pat in (f"rating_{uid}.png", f"rating_{uid}.csv", f"summary_{uid}.txt"):
-        p = out_dir / pat
-        if p.exists():
-            try:
-                p.unlink()
-                removed.append(pat)
-            except OSError:
-                pass
-    if fresh:
-        p = out_dir / "results.json"
-        if p.exists():
-            try:
-                p.unlink()
-                removed.append("results.json")
-            except OSError:
-                pass
-    if removed:
-        print(f"      已清掉上次的结果: {', '.join(removed)}")
+def unique_run_dir(parent: pathlib.Path, stamp: str) -> pathlib.Path:
+    """每次输出都放进独立的时间戳子目录, 不覆盖以前跑出来的图/CSV/概览."""
+    path = parent / stamp
+    n = 1
+    while path.exists():
+        n += 1
+        path = parent / f"{stamp}_{n}"
+    path.mkdir(parents=True)
+    return path
+
+
+def write_cache(cache: pathlib.Path, state: dict[str, Any], merge: bool = True) -> None:
+    """写跑谱缓存; merge 时保留文件里已有的其它对局, 免得跑少量局就把旧记录冲掉."""
+    games = [g for g in (state.get("games") or []) if isinstance(g, dict) and g.get("uuid")]
+    if merge:
+        merged: dict[tuple[str, Any], dict[str, Any]] = {}
+        try:
+            old = json.loads(cache.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            old = {}
+        if isinstance(old, dict):
+            for g in old.get("games") or []:
+                if isinstance(g, dict) and g.get("uuid"):
+                    merged[(g["uuid"], g.get("seat"))] = g
+        for g in games:
+            key = (g["uuid"], g.get("seat"))
+            prev = merged.get(key)
+            if prev and g.get("rating") is None and prev.get("rating") is not None:
+                continue  # 这次没跑出来, 别把以前跑好的分数冲掉
+            merged[key] = g
+        games = sorted(merged.values(), key=lambda g: g.get("start_time", 0))
+    state = {**state, "games": games}
+    cache.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def write_csv(games: list[Game], path: pathlib.Path, include_players: bool = False) -> None:
@@ -1035,6 +1077,11 @@ def player_output_dir(base: pathlib.Path, nickname: str, rival: bool = False) ->
     return base / (folder + "_rival" if rival else folder)
 
 
+# 旧版缓存没有这些键, 缺任何一个就说明这局要重跑, 否则庄家统计会显示成 "-"
+DEALER_STAT_KEYS = ("oya_kyoku", "oya_riichi", "oya_hora",
+                    "oya_rival_n", "oya_rival_riichi9", "oya_rival_tsumo9")
+
+
 def restore_cache(cache: pathlib.Path, games: list[Game], uid: int, position: str = "",
                   require_stats: bool = False) -> None:
     if not cache.exists():
@@ -1052,8 +1099,10 @@ def restore_cache(cache: pathlib.Path, games: list[Game], uid: int, position: st
             cached = prev.get((game.uuid, game.seat))
             if not cached or cached.get("player_id") not in (None, game.player_id):
                 continue
-            if require_stats and not cached.get("hand_stats"):
-                continue  # 旧版缓存没有逐手统计, 这局重跑一次
+            stats = cached.get("hand_stats")
+            if require_stats and not (isinstance(stats, dict)
+                                      and all(k in stats for k in DEALER_STAT_KEYS)):
+                continue  # 旧版缓存没有逐手/庄家统计, 这局重跑一次
             if cached.get("rating") is not None:
                 game.rating = cached["rating"]
                 game.accordance = cached.get("accordance")
@@ -1162,18 +1211,24 @@ def hand_shanten(tehai: list[Any]) -> int:
 
 
 def parse_hand_stats(log: list[dict[str, Any]], seat: int) -> dict[str, int]:
-    """从 mjai 逐手日志统计某个座位: 和了/一发/立直(巡目, 和了)/起手向听(亲/子).
+    """从 mjai 逐手日志统计某个座位: 和了/一发/立直(巡目, 和了)/起手向听(亲/子)/做庄统计.
 
     mjai 的 hora 事件里没有役种列表, 所以「一发」按规则推断:
     立直宣言后, 在自己下一次打牌(或任何人鸣牌/杠)之前和了, 就算一发.
+
+    庄家口径: 只统计 seat 坐庄的局. 「闲家」是同局里除庄家外的其他家;
+    「9 巡内」按该家自己第 9 次打牌之前(含)计算.
     """
     st = {"hora": 0, "ippatsu": 0, "riichi": 0, "riichi_win": 0, "riichi_turn_sum": 0,
-          "oya_n": 0, "oya_shanten_sum": 0, "ko_n": 0, "ko_shanten_sum": 0}
+          "oya_n": 0, "oya_shanten_sum": 0, "ko_n": 0, "ko_shanten_sum": 0,
+          "oya_kyoku": 0, "oya_riichi": 0, "oya_hora": 0,
+          "oya_rival_n": 0, "oya_rival_riichi9": 0, "oya_rival_tsumo9": 0}
     discards = [0, 0, 0, 0]
     reach_turn: dict[int, int] = {}   # 本局宣言立直的座位 -> 巡目
     riichi = [False] * 4              # 本局已成立的立直
     ippatsu = [False] * 4             # 一发窗口开着
     dealer_tehai: list[Any] | None = None  # 自家是亲时, 等第一张摸牌再算向听(14 张)
+    cur_oya: int | None = None        # 本局庄家座位
 
     def close_windows() -> None:
         for k in range(4):
@@ -1187,7 +1242,12 @@ def parse_hand_stats(log: list[dict[str, Any]], seat: int) -> dict[str, int]:
             discards = [0, 0, 0, 0]
             reach_turn, riichi, ippatsu = {}, [False] * 4, [False] * 4
             dealer_tehai = None
+            oya = ev.get("oya")
+            cur_oya = oya if isinstance(oya, int) else None
             tehais = ev.get("tehais") or []
+            if cur_oya == seat:
+                st["oya_kyoku"] += 1
+                st["oya_rival_n"] += max(0, len(tehais) - 1)  # 三麻只有 2 个闲家
             if 0 <= seat < len(tehais) and len(tehais[seat]) == 13:
                 if ev.get("oya") == seat:
                     dealer_tehai = list(tehais[seat])  # 亲家多摸一张, 见下面 tsumo 分支
@@ -1203,16 +1263,21 @@ def parse_hand_stats(log: list[dict[str, Any]], seat: int) -> dict[str, int]:
                 dealer_tehai = None
         elif kind == "reach":
             actor = ev.get("actor")
-            if actor == seat:
-                reach_turn[seat] = discards[seat] + 1
+            if isinstance(actor, int) and 0 <= actor < 4:
+                reach_turn[actor] = discards[actor] + 1  # 记所有人, 闲家 9 巡内立直要用
         elif kind == "reach_accepted":
             actor = ev.get("actor")
-            if actor == seat and seat in reach_turn:
+            turn = reach_turn.pop(actor, None)
+            if actor == seat and turn is not None:
                 st["riichi"] += 1
-                st["riichi_turn_sum"] += reach_turn[seat]
+                st["riichi_turn_sum"] += turn
                 riichi[seat] = True
                 ippatsu[seat] = True
-            reach_turn.pop(actor, None)
+                if cur_oya == seat:
+                    st["oya_riichi"] += 1
+            elif (cur_oya == seat and isinstance(actor, int) and actor != seat
+                  and turn is not None and turn <= 9):
+                st["oya_rival_riichi9"] += 1  # 自己坐庄时, 闲家 9 巡内立直
         elif kind == "dahai":
             actor = ev.get("actor")
             if isinstance(actor, int) and 0 <= actor < 4:
@@ -1221,13 +1286,20 @@ def parse_hand_stats(log: list[dict[str, Any]], seat: int) -> dict[str, int]:
         elif kind in ("chi", "pon", "daiminkan", "ankan", "kakan"):
             close_windows()           # 鸣牌/杠, 所有人的一发窗口都关闭
         elif kind == "hora":
-            if ev.get("actor") == seat:
+            actor = ev.get("actor")
+            if actor == seat:
                 st["hora"] += 1
+                if cur_oya == seat:
+                    st["oya_hora"] += 1
                 if ippatsu[seat]:
                     st["ippatsu"] += 1
                 if riichi[seat]:
                     st["riichi_win"] += 1
                 ippatsu[seat] = False
+            elif (cur_oya == seat and isinstance(actor, int) and 0 <= actor < 4
+                  and ev.get("target") == actor  # target == actor 表示自摸
+                  and discards[actor] + 1 <= 9):
+                st["oya_rival_tsumo9"] += 1  # 自己坐庄时, 闲家 9 巡内自摸
         elif kind in ("end_kyoku", "ryukyoku"):
             close_windows()
     return st
@@ -1277,6 +1349,7 @@ def format_rival_overview(games: list[Game], nickname: str, uid: int,
             f"(亲 {oya_sum / oya_n:.2f} / 子 {ko_sum / ko_n:.2f})"
             if oya_n and ko_n else "起手向听      -",
         ]
+    lines += dealer_lines(hands)
     lines += [f"pt 有效数据 {len(deltas)}/{n} 场", "", "统计范围：仅输入玩家这批牌谱", "各局对手可能不同，pt 从 0 累计", "段位及牌谱屋面板统计不适用"]
     return lines
 
@@ -1311,7 +1384,7 @@ async def run(args: argparse.Namespace, rival: bool = False) -> int:
     def save_group(cache_p: pathlib.Path, st: dict[str, Any], gs: list[Game], pos: str) -> None:
         st["overview"] = group_overview(gs, pos)
         st["games"] = [asdict(x) for x in gs]
-        cache_p.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+        write_cache(cache_p, st, merge=not args.fresh)
 
     try:
         async with async_playwright() as p:
@@ -1346,20 +1419,22 @@ async def run(args: argparse.Namespace, rival: bool = False) -> int:
             for position, games in groups.items():
                 target_dir = out_dir / position if position else out_dir
                 target_dir.mkdir(parents=True, exist_ok=True)
-                clean_previous(target_dir, uid, args.fresh)
                 cache = target_dir / "results.json"
-                restore_cache(cache, games, uid, position, require_stats=rival)
+                if args.fresh and cache.exists():
+                    cache.unlink()
+                    print("      --fresh: 已清掉跑谱缓存")
+                restore_cache(cache, games, uid, position, require_stats=True)
                 # 兼容旧版放在 rating_out 根目录的自身缓存；不改动旧文件。
                 if not rival and not args.fresh and not cache.exists():
                     restore_cache(base_dir / "results.json", games, uid)
-                print(f"      {position or nickname}: 取到 {len(games)} 局，输出到 {target_dir}")
+                print(f"      {position or nickname}: 取到 {len(games)} 局，缓存 {cache}")
 
                 overview = group_overview(games, position)
                 print_overview(overview)
                 state = {"uid": uid, "nickname": nickname, "position": position, "model": MODEL_TAG,
                          "overview": overview, "games": [asdict(g) for g in games]}
                 print(f"[2/3] {position or nickname} Mortal {MODEL_TAG} 跑谱 (并发 {args.concurrency}) ...")
-                await review_all(ctx, games, cache, args.concurrency, state)
+                await review_all(ctx, games, cache, args.concurrency, state, merge=not args.fresh)
                 save_group(cache, state, games, position)
                 results.append((position, games, target_dir))
                 jobs.append((position, games, cache, state))
@@ -1372,7 +1447,7 @@ async def run(args: argparse.Namespace, rival: bool = False) -> int:
                     if not left:
                         continue
                     print(f"      {position or nickname}: 重试 {left} 局 (并发 {args.concurrency}) ...")
-                    await review_all(ctx, games, cache, args.concurrency, state)
+                    await review_all(ctx, games, cache, args.concurrency, state, merge=not args.fresh)
                     save_group(cache, state, games, position)
             for position, games, cache, state in jobs:
                 left = sum(g.rating is None for g in games)
@@ -1380,7 +1455,7 @@ async def run(args: argparse.Namespace, rival: bool = False) -> int:
                     continue
                 print(f"\n[!] {position or nickname} 还有 {left} 局自动提交不了, 转人工介入 "
                       f"(一次一局, 请在浏览器里手动过验证并提交)")
-                await manual_review(ctx, games, cache, state)
+                await manual_review(ctx, games, cache, state, merge=not args.fresh)
                 save_group(cache, state, games, position)
             await ctx.close()
             try:
@@ -1391,13 +1466,15 @@ async def run(args: argparse.Namespace, rival: bool = False) -> int:
         close_browser(proc)
 
     print("[3/3] 输出 ...")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
     for position, games, target_dir in results:
+        run_dir = unique_run_dir(target_dir, stamp)  # 每次跑单独一个目录, 旧结果不动
         overview = group_overview(games, position)
-        write_csv(games, target_dir / f"rating_{uid}.csv", include_players=rival)
-        png = target_dir / f"rating_{uid}.png"
+        write_csv(games, run_dir / f"rating_{uid}.csv", include_players=rival)
+        png = run_dir / f"rating_{uid}.png"
         title = f"{nickname} 的{position}" if rival else nickname
         draw_chart(games, uid, title, overview, level_score, level_cap, png, aggregate_pt=rival)
-        summary_txt = target_dir / f"summary_{uid}.txt"
+        summary_txt = run_dir / f"summary_{uid}.txt"
         summary_txt.write_text("\n".join(overview) + "\n", encoding="utf-8")
         print(f"  [OK] 概览文本: {summary_txt}")
         if not args.no_show and png.exists():
